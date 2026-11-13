@@ -1,52 +1,48 @@
+
 import io
 import json
 import logging
 from pathlib import Path
+
 import pandas as pd
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+
 from src import (
-    DatasetInfo,
-    DatasetStorage,
     HealthResponse,
     ProcessConfig,
-    ProcessingReport,
+    MovieStorage,
+    MovieUploadInfo,
+    MovieDataResponse,
+    MovieProcessingReport,
     setup_logging,
-    log_requests
+    log_requests,
 )
+from src.storage import MOVIE_COLUMNS
 from data_pipeline import (
     create_cleaning_report,
     process_data,
     validate_dataframe,
 )
-from src import (
-MovieStorage,
-MovieUploadInfo,
-MovieDataResponse,
-MovieProcessingReport,
-)
-from src.storage import MOVIE_COLUMNS
 
 setup_logging(verbose=True)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Data Processing API", version="1.0.0")
-
+app = FastAPI(title="Movie API", version="1.0.0")
 app.middleware("http")(log_requests)
 
 storage = MovieStorage()
 
+
 @app.get("/health", response_model=HealthResponse)
 def health_check():
-    """Return the application status and version."""
     return {"status": "ok", "version": "1.0.0"}
 
-@app.post("/upload", response_model=DatasetInfo)
-async def upload_dataset(file: UploadFile = File(...)):
-    """Read and store a CSV upload."""
+
+@app.post("/upload", response_model=MovieUploadInfo)
+async def upload_movies(file: UploadFile = File(...)):
     extension = Path(file.filename or "").suffix.lower()
 
     if extension != ".csv":
-        logger.warning("Unsupported file format: %s", extension)
         raise HTTPException(
             status_code=400,
             detail="Only CSV files are supported"
@@ -56,60 +52,85 @@ async def upload_dataset(file: UploadFile = File(...)):
 
     try:
         df = pd.read_csv(io.BytesIO(contents))
-    except (pd.errors.EmptyDataError, pd.errors.ParserError,
-            UnicodeDecodeError):
-        logger.warning("Unable to read CSV file: %s", file.filename)
+    except (
+        pd.errors.EmptyDataError,
+        pd.errors.ParserError,
+        UnicodeDecodeError,
+    ):
         raise HTTPException(
             status_code=400,
             detail="Invalid or unreadable CSV file"
         )
 
-    dataset_id = storage.save(df, file.filename)
-
-    logger.info(
-        "Uploaded dataset: id=%s, filename=%s, rows=%s",
-        dataset_id, file.filename, len(df)
-    )
-
-    return storage.get_metadata(dataset_id)
-
-@app.get("/datasets/{dataset_id}")
-def get_dataset(dataset_id: int, limit: int = Query(default=100, ge=1)):
-    """Return up to limit rows from a stored dataset."""
-    df = storage.get(dataset_id)
-
-    if df is None:
-        logger.warning("Dataset not found: %s", dataset_id)
+    if len(df.columns) != len(MOVIE_COLUMNS) or set(df.columns) != set(MOVIE_COLUMNS):
         raise HTTPException(
-            status_code=404,
-            detail="Dataset not found"
+            status_code=400,
+            detail="Invalid movie columns"
         )
 
-    records = json.loads(df.head(limit).to_json(orient="records"))
+    if df.empty:
+        raise HTTPException(
+            status_code=400,
+            detail="CSV must contain at least one movie"
+        )
+
+    df = df[MOVIE_COLUMNS]
+    storage.save(df)
 
     logger.info(
-        "Retrieved dataset: id=%s, returned_rows=%s",
-        dataset_id, len(records)
+        "Uploaded movies: filename=%s, rows=%s",
+        file.filename, len(df)
     )
 
     return {
-        "id": dataset_id,
-        "data": records,
-        "total_rows": len(df)
+        "filename": file.filename,
+        "rows": len(df),
+        "columns": len(df.columns),
+        "column_names": list(df.columns),
     }
 
-@app.post(
-    "/datasets/{dataset_id}/process",
-    response_model=ProcessingReport
-)
-def process_dataset(dataset_id: int, config: ProcessConfig):
-    """Validate and process a stored dataset using MP1 functions."""
 
-    df = storage.get(dataset_id)
+@app.get("/movies", response_model=MovieDataResponse)
+def get_movies(limit: int = Query(default=100, ge=1)):
+    records = storage.select_columns(MOVIE_COLUMNS, limit)
+    total = storage.count_movies()
 
-    if df is None:
-        logger.warning("Dataset not found: %s", dataset_id)
-        raise HTTPException(status_code=404, detail="Dataset not found")
+    logger.info("Retrieved movies: returned_rows=%s", len(records))
+
+    return {
+        "data": records,
+        "total_rows": total,
+    }
+
+
+@app.get("/movies/search", response_model=list[dict])
+def query_movies(
+    columns: list[str] = Query(default=["title"]),
+    min_rating: float = Query(default=0, ge=0, le=10),
+    limit: int = Query(default=100, ge=1),
+):
+    try:
+        records = storage.query_movies(columns, min_rating, limit)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
+    logger.info(
+        "Queried movies: columns=%s, min_rating=%s, returned_rows=%s",
+        columns, min_rating, len(records)
+    )
+
+    return records
+
+
+@app.post("/movies/process", response_model=MovieProcessingReport)
+def process_movies(config: ProcessConfig):
+    df = storage.get()
+
+    if df.empty:
+        raise HTTPException(
+            status_code=400,
+            detail="No movies to process"
+        )
 
     config_dict = config.model_dump()
 
@@ -119,6 +140,7 @@ def process_dataset(dataset_id: int, config: ProcessConfig):
                 status_code=400,
                 detail=f"Numeric column not found: {column}"
             )
+
     try:
         validated_df = validate_dataframe(
             df,
@@ -137,23 +159,18 @@ def process_dataset(dataset_id: int, config: ProcessConfig):
 
     except ValueError as error:
         logger.warning("Processing failed: %s", error)
-        raise HTTPException(
-            status_code=400,
-            detail=str(error)
-        )
+        raise HTTPException(status_code=400, detail=str(error))
 
-    storage.update(dataset_id, processed_df)
+    storage.save(processed_df)
 
     logger.info(
-        "Processed dataset: id=%s, validation_removed=%s, rows_before=%s, rows_after=%s",
-        dataset_id,
+        "Processed movies: validation_removed=%s, rows_before=%s, rows_after=%s",
         validation_rows_removed,
         len(validated_copy),
         len(processed_df)
     )
 
     return {
-        "id": dataset_id,
         "validation_rows_removed": validation_rows_removed,
-        "cleaning_report": cleaning_report
+        "cleaning_report": cleaning_report,
     }
